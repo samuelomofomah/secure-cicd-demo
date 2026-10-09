@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Secure Pipeline Demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Live site</p>
+
+    {# CHANGE THE HEADLINE BELOW to demo the pipeline. #}
+    <h1>Shipped through a locked-down pipeline</h1>
+
+    <p class="lede">
+      This page was checked, scanned and published by a robot that holds no
+      passwords, can touch one storage bucket, and leaves a record every time
+      it signs in.
+    </p>
+
+    <dl class="release">
+      <div>
+        <dt>Release</dt>
+        <dd>#{{ release }}</dd>
+      </div>
+      <div>
+        <dt>Change ID</dt>
+        <dd>{{ change_id }}</dd>
+      </div>
+      <div>
+        <dt>Published</dt>
+        <dd>{{ published }}</dd>
+      </div>
+    </dl>
+  </main>
+</body>
+</html>

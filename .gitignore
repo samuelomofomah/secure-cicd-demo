@@ -1,0 +1,11 @@
+# Build output
+dist/
+__pycache__/
+.venv/
+
+# Terraform working files. The state file describes your AWS account, so it
+# stays on your machine.
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/terraform.tfvars

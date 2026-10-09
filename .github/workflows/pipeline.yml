@@ -1,0 +1,188 @@
+# The secure pipeline: the written instructions GitHub follows every time the code changes.
+#
+# Every third-party tool below is pinned to an exact fingerprint (the long code
+# after the @), not a version label. A label can be quietly moved to different
+# code; a fingerprint cannot.
+name: Secure pipeline
+
+on:
+  push:
+    branches: [main]      # a change lands on main -> test, scan, then publish
+  pull_request:
+    branches: [main]      # someone proposes a change -> test and scan only
+
+# Default for every job: read the code, nothing else. Extra rights are granted
+# one job at a time, further down.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # ---- 1. Test and scan ------------------------------------------------------
+  check:
+    name: Test and scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Scan the code for passwords and keys
+        run: bash tests/secret_scan.sh
+
+      - name: Scan third-party code for known vulnerabilities
+        run: |
+          python -m pip install --quiet --disable-pip-version-check pip-audit==2.10.1
+          pip-audit -r requirements.txt
+
+      - name: Build the site
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python -m pip install --quiet --disable-pip-version-check -r requirements.txt
+          python build.py
+
+      - name: Run the quality checks
+        run: bash tests/check.sh dist
+
+      - name: Keep the approved build for the deploy job
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---- 2. Proof that a pull request cannot reach AWS --------------------------
+  # A pull request is a proposal, not an approved change. This job asks AWS for
+  # access the same way the real deploy does, and passes only if AWS says no.
+  pr-lockdown:
+    name: Prove pull requests cannot reach AWS
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write     # allowed to ask GitHub for an identity pass
+    steps:
+      - name: Try to sign in to AWS from a pull request (expected to be refused)
+        id: attempt
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: pull-request-probe
+          mask-aws-account-id: true
+          disable-retry: true
+
+      - name: Confirm AWS refused
+        env:
+          OUTCOME: ${{ steps.attempt.outcome }}
+          ROLE: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          if [[ -z "$ROLE" ]]; then
+            echo "FAIL  The AWS_ROLE_ARN secret is not set, so this test proves nothing."
+            exit 1
+          fi
+          if [[ "$OUTCOME" == "failure" ]]; then
+            echo "PASS  AWS refused to sign in a pull request. Only the main branch is trusted."
+          else
+            echo "FAIL  A pull request was able to sign in to AWS. The trust policy is too loose."
+            exit 1
+          fi
+
+  # ---- 3. Deploy --------------------------------------------------------------
+  deploy:
+    name: Deploy to AWS
+    needs: check                      # only starts if every check and scan passed
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write                 # allowed to ask GitHub for an identity pass
+    concurrency:
+      group: production               # one release at a time, in order
+      cancel-in-progress: false
+    env:
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      SITE_URL: ${{ vars.SITE_URL }}
+    steps:
+      - name: Get the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the approved build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site
+          path: dist
+
+      # OIDC: no AWS password is stored anywhere. GitHub vouches for this exact
+      # run, and AWS swaps that for a pass that expires in 15 minutes.
+      - name: Sign in to AWS with a 15-minute pass (no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: release-${{ github.run_number }}
+          role-duration-seconds: 900
+          mask-aws-account-id: true
+
+      - name: Show who the pipeline is signed in as
+        run: aws sts get-caller-identity --query Arn --output text
+
+      - name: Publish the site
+        run: aws s3 sync dist "s3://${S3_BUCKET}" --delete --cache-control "no-cache"
+
+      - name: Check the live site shows this release
+        env:
+          RELEASE: ${{ github.run_number }}
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --silent --show-error --fail --max-time 10 "$SITE_URL" | grep -q "#${RELEASE}<"; then
+              echo "PASS  ${SITE_URL} is serving release #${RELEASE}"
+              exit 0
+            fi
+            echo "Not live yet (attempt ${attempt}), waiting..."
+            sleep 3
+          done
+          echo "FAIL  ${SITE_URL} is not serving release #${RELEASE}"
+          exit 1
+
+      - name: Prove the pipeline cannot do anything else in AWS
+        run: bash tests/least_privilege.sh
+
+  # ---- 4. Tell the team -------------------------------------------------------
+  notify:
+    name: Tell the team on Slack
+    needs: [check, pr-lockdown, deploy]
+    if: always()                      # report failures as well as successes
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Send the Slack alert
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          LOCKDOWN_RESULT: ${{ needs.pr-lockdown.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          CHANGE_TITLE: ${{ github.event.pull_request.title || github.event.head_commit.message }}
+          ACTOR: ${{ github.actor }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: bash scripts/notify.sh
